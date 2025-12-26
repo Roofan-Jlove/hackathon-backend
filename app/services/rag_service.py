@@ -1,0 +1,270 @@
+import os
+from typing import List, Tuple, Optional
+from app.core.config import get_logger
+from app.models import Message, Conversation, UserProfile
+from app.services.indexing_service import indexing_service
+from app.services.personalization_service import PersonalizationService
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from qdrant_client import QdrantClient
+from openai import OpenAI
+from uuid import UUID
+from sqlalchemy.orm import Session
+
+logger = get_logger(__name__)
+
+class RAGService:
+    def __init__(self):
+        self.embeddings_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        self.qdrant_client = QdrantClient(
+            url=os.getenv("QDRANT_URL"),
+            api_key=os.getenv("QDRANT_API_KEY"),
+            prefer_grpc=False
+        )
+        self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        logger.info("RAGService initialized.")
+
+    async def query_rag_pipeline(self, question: str, context: str = None, conversation_id: UUID = None, user_profile: Optional[UserProfile] = None) -> Tuple[str, List[dict]]:
+        """
+        Main RAG pipeline logic with personalization support.
+        1. Embed the user's question.
+        2. Query the vector store for relevant context.
+        3. Combine question and context into a personalized prompt.
+        4. Call a language model to generate an answer.
+
+        Args:
+            question: User's question
+            context: Optional additional context (e.g., selected text)
+            conversation_id: Optional conversation ID for context
+            user_profile: Optional user profile for personalization
+        """
+        logger.info(f"Querying RAG pipeline with question: '{question[:50]}...'")
+
+        # Determine complexity level for personalization
+        complexity = PersonalizationService.get_complexity_level(user_profile) if user_profile else 'intermediate'
+        user_context = PersonalizationService.get_personalization_context(user_profile) if user_profile else None
+        logger.info(f"Using complexity level: {complexity}")
+
+        # 1. Embed the query
+        query_vector = self.embeddings_model.embed_query(question)
+        logger.debug("Question embedded.")
+
+        # 2. Query Qdrant for similar content
+        search_results = self.qdrant_client.query_points(
+            collection_name="book_content",
+            query=query_vector,
+            limit=5,  # Increase to 5 for more context
+            with_payload=True,
+            with_vectors=False
+        )
+
+        # Filter results by relevance score if needed
+        relevant_results = [hit for hit in search_results.points if hit.score > 0.3]  # Threshold for relevance
+        if not relevant_results:
+            relevant_results = search_results.points[:3]  # Fallback to top 3 if none meet threshold
+
+        retrieved_chunks = [hit.payload['content'] for hit in relevant_results]
+        logger.debug(f"Retrieved {len(retrieved_chunks)} relevant chunks from Qdrant.")
+
+        # 3. Build prompt with context and personalization
+        if user_profile:
+            prompt = self._build_personalized_prompt(question, retrieved_chunks, context, user_context, complexity)
+        else:
+            prompt = self._build_prompt(question, retrieved_chunks, context)
+
+        # 4. Generate response with OpenAI (with personalized system prompt)
+        system_prompt = self._get_system_prompt(complexity) if user_profile else self._get_default_system_prompt()
+
+        try:
+            response = self.openai_client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),  # Allow model selection via env
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3  # Lower temperature for more consistent answers
+            )
+            answer = response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"Error calling OpenAI API: {e}")
+            # Provide more specific error messages based on the error type
+            error_str = str(e)
+            if "insufficient_quota" in error_str or "429" in error_str:
+                answer = "⚠️ The OpenAI API quota has been exceeded. Please check your billing details at platform.openai.com or update your API key in the backend/.env file."
+            elif "invalid_api_key" in error_str or "401" in error_str:
+                answer = "⚠️ Invalid OpenAI API key. Please update your API key in the backend/.env file."
+            elif "rate_limit" in error_str:
+                answer = "⚠️ Rate limit exceeded. Please wait a moment and try again."
+            else:
+                answer = f"⚠️ Error generating response: {error_str}. Please contact support if this persists."
+
+        logger.info("Answer generated by OpenAI.")
+
+        # Format sources with additional metadata
+        sources = [
+            {
+                "chunk": hit.payload['content'][:500] + "..." if len(hit.payload['content']) > 500 else hit.payload['content'],  # Truncate long chunks
+                "score": hit.score,
+                "source_file": hit.payload.get('source_file', 'unknown'),
+                "chunk_index": hit.payload.get('chunk_index', -1)
+            }
+            for hit in relevant_results
+        ]
+
+        return answer, sources
+
+    def _build_prompt(self, question: str, context_chunks: List[str], user_context: str = None) -> str:
+        """
+        Builds a prompt for the language model, combining the user's question
+        with the retrieved context and any additional user-provided context.
+        """
+        context_str = "\n---\n".join(context_chunks)
+
+        prompt = f"""
+        You are an AI assistant for the book "Physical AI & Humanoid Robotics".
+        Your purpose is to answer questions based ONLY on the provided context from the book.
+
+        If the answer is not explicitly available in the context, respond with:
+        "I cannot find the answer in the book content. Please refer directly to the book for this information."
+
+        If the user has provided specific text they've selected, prioritize answering based on that text.
+
+        CONTEXT FROM BOOK:
+        {context_str}
+
+        """
+
+        if user_context:
+            prompt += f"""
+        ADDITIONAL USER CONTEXT (from selected text):
+        {user_context}
+
+        """
+
+        prompt += f"""
+        QUESTION: {question}
+
+        ANSWER:
+        """
+
+        return prompt.strip()
+
+    def _build_personalized_prompt(self, question: str, context_chunks: List[str],
+                                   selected_context: str, user_context: str, complexity: str) -> str:
+        """
+        Build a personalized prompt based on user profile.
+
+        Args:
+            question: User's question
+            context_chunks: Retrieved context from vector DB
+            selected_context: Selected text from page
+            user_context: User background context
+            complexity: Complexity level ('beginner', 'intermediate', 'advanced')
+
+        Returns:
+            Formatted prompt string
+        """
+        context_str = "\n---\n".join(context_chunks)
+
+        prompt_parts = []
+
+        # User background
+        if user_context:
+            prompt_parts.append(f"USER BACKGROUND: {user_context}")
+
+        # Context from retrieval
+        prompt_parts.append(f"CONTEXT FROM BOOK:\n{context_str}")
+
+        # Selected context if available
+        if selected_context:
+            prompt_parts.append(f"USER SELECTED TEXT:\n{selected_context}")
+
+        # Complexity-specific instructions
+        complexity_instructions = {
+            'beginner': (
+                "Please provide a detailed explanation with examples. Define any technical terms. "
+                "Include prerequisites and background information where relevant."
+            ),
+            'intermediate': (
+                "Please provide a clear explanation with relevant examples. "
+                "You can use technical terms but provide brief explanations."
+            ),
+            'advanced': (
+                "Please provide a concise, technical explanation focusing on key insights. "
+                "Skip basic explanations and focus on advanced concepts and edge cases."
+            )
+        }
+        prompt_parts.append(complexity_instructions.get(complexity, complexity_instructions['intermediate']))
+
+        # The question
+        prompt_parts.append(f"QUESTION: {question}")
+        prompt_parts.append("ANSWER:")
+
+        return "\n\n".join(prompt_parts)
+
+    def _get_system_prompt(self, complexity: str) -> str:
+        """
+        Get personalized system prompt based on complexity level.
+
+        Args:
+            complexity: 'beginner', 'intermediate', or 'advanced'
+
+        Returns:
+            System prompt string
+        """
+        prompts = {
+            'beginner': (
+                "You are a helpful teaching assistant for 'Physical AI & Humanoid Robotics'. "
+                "The user is a beginner, so explain concepts clearly with examples and analogies. "
+                "Avoid jargon unless you explain it. Include prerequisites when relevant. "
+                "Be encouraging and patient. Answer based ONLY on the provided context."
+            ),
+            'intermediate': (
+                "You are a helpful teaching assistant for 'Physical AI & Humanoid Robotics'. "
+                "The user has intermediate knowledge, so you can use technical terms but should still "
+                "provide explanations. Balance theory with practical examples. "
+                "Answer based ONLY on the provided context."
+            ),
+            'advanced': (
+                "You are a helpful teaching assistant for 'Physical AI & Humanoid Robotics'. "
+                "The user is advanced, so you can use technical terminology freely. "
+                "Focus on deep insights, edge cases, and advanced topics. Be concise. "
+                "Answer based ONLY on the provided context."
+            )
+        }
+
+        return prompts.get(complexity, prompts['intermediate'])
+
+    def _get_default_system_prompt(self) -> str:
+        """
+        Get default system prompt for non-authenticated users.
+
+        Returns:
+            Default system prompt string
+        """
+        return (
+            "You are an AI assistant for the book 'Physical AI & Humanoid Robotics'. "
+            "Answer questions based only on the provided context. If the answer is not "
+            "in the context, politely say that you don't know and suggest checking "
+            "the book directly. Be helpful and maintain a friendly tone."
+        )
+
+    async def index_book_content_if_needed(self):
+        """
+        Check if book content is indexed, and if not, index it.
+        """
+        try:
+            # Check if collection exists and has content
+            collection_info = self.qdrant_client.get_collection("book_content")
+            if collection_info.points_count == 0:
+                logger.info("Book content not found in vector store. Starting indexing process...")
+                await indexing_service.index_book_content()
+                logger.info("Book content indexing completed.")
+            else:
+                logger.info(f"Book content already indexed with {collection_info.points_count} chunks.")
+        except Exception as e:
+            logger.error(f"Error checking/indexing book content: {e}")
+            # If collection doesn't exist, create and index it
+            await indexing_service.index_book_content()
+
+# Singleton instance of the service
+rag_service = RAGService()

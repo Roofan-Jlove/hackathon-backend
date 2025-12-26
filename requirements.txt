@@ -1,0 +1,17 @@
+fastapi>=0.124.2,<0.125.0
+uvicorn[standard]>=0.38.0,<0.39.0
+langchain
+langchain-community
+langchain-openai
+qdrant-client
+sentence-transformers
+google-cloud-translate
+psycopg2-binary
+python-dotenv
+openai
+passlib[bcrypt]
+python-jose[cryptography]
+sqlalchemy
+alembic
+pydantic
+pydantic-settings
