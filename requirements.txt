@@ -18,3 +18,4 @@ sqlalchemy
 alembic
 pydantic
 pydantic-settings
+email-validator
