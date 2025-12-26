@@ -39,7 +39,7 @@ wheels/
 Thumbs.db
 
 # Poetry
-poetry.lock
+# poetry.lock - commented out because Railway needs it for reproducible builds
 
 # Node modules (if any)
 node_modules/
